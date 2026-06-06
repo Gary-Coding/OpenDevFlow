@@ -307,6 +307,39 @@ def _skill_semantic_missing_items(skill_instruction: str, content: str) -> list[
     return list(dict.fromkeys(missing))
 
 
+def _extract_artifact_content(reply: str) -> str | None:
+    """从 AI 回复中提取明确声明要写入工作区文件的产物内容。
+
+    普通聊天回复、澄清问题和过程分析只保存到会话消息，不应自动覆盖阶段文档。
+    只有模型按约定输出 <artifact>...</artifact> 或 fenced artifact 代码块时才更新文档。
+    """
+    normalized = reply.strip()
+    if not normalized:
+        return None
+
+    tag_start = normalized.find("<artifact>")
+    tag_end = normalized.find("</artifact>")
+    if tag_start >= 0 and tag_end > tag_start:
+        artifact = normalized[tag_start + len("<artifact>"):tag_end].strip()
+        return artifact or None
+
+    fence_markers = ["```artifact", "```markdown artifact", "```md artifact"]
+    for marker in fence_markers:
+        start = normalized.lower().find(marker)
+        if start < 0:
+            continue
+        content_start = normalized.find("\n", start)
+        if content_start < 0:
+            continue
+        end = normalized.find("```", content_start + 1)
+        if end < 0:
+            continue
+        artifact = normalized[content_start + 1:end].strip()
+        return artifact or None
+
+    return None
+
+
 def _run_gate_check(
     db: Session,
     session: StageSession,
@@ -459,8 +492,8 @@ async def _build_stage_prompts(
             continue
         seen.add(file_path)
         content = read_workspace_file(workspace, file_path)
-    if content:
-        files.append(f"## {file_path}\n```text\n{content[:6000]}\n```")
+        if content:
+            files.append(f"## {file_path}\n```text\n{content[:6000]}\n```")
     # 需求澄清、PRD、测试计划等非编码阶段也读取最新代码快照，避免 AI 脱离现有业务事实。
     code_context = db.scalar(
         select(CodeContextSnapshot)
@@ -479,8 +512,11 @@ async def _build_stage_prompts(
     )
     system_prompt = (
         "你是 OpenDevFlow 平台中的阶段 AI 助手，需要基于当前需求、工作流阶段、Skill 和工作空间文件推进交付。\n"
-        "回答使用中文，直接给出可执行建议和阶段产物草稿，不要编造不存在的信息。\n"
-        "如果信息不足，先提出明确的问题；如果可以更新产物，请输出完整 Markdown 草稿。\n\n"
+        "回答使用中文，直接给出可执行建议，不要编造不存在的信息。\n"
+        "普通澄清、提问、分析和建议只作为聊天回复输出，不要包裹为产物。\n"
+        "只有当用户明确要求生成/更新当前阶段文档，或你判断信息已经足够并需要写入工作区文件时，才在回复中附加一个独立产物块。\n"
+        "产物块必须使用 <artifact> 和 </artifact> 包裹，标签内部放完整 Markdown 文档；标签外可以保留简短说明。\n"
+        "如果信息不足，先提出明确问题，不要输出 <artifact>。\n\n"
         "# 当前阶段必须遵循的 Skill 指令\n"
         f"- Skill：{skill.name} ({skill.key})\n"
         f"- 来源：{skill.git_url or '-'} @ {skill.git_ref or 'main'} / {skill.sub_path or ''}/{skill.entry_file or 'SKILL.md'}\n\n"
@@ -774,21 +810,34 @@ async def stream_stage_session_message(
                 if not session_for_update:
                     raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="阶段会话不存在")
                 update_db.add(StageMessage(session_id=session_id_value, role="assistant", content=reply))
+                artifact_content = _extract_artifact_content(reply)
                 session_for_update.draft_title = stage_file
                 session_for_update.draft_type = _artifact_type_by_stage(stage_key)
-                session_for_update.draft_content = reply
                 session_for_update.status = "active"
-                write_workspace_file(SimpleNamespace(root_path=workspace_root_path), stage_file, reply)
-                update_db.add(
-                    StageToolCall(
-                        session_id=session_id_value,
-                        tool_name="write_stage_artifact_file",
-                        input_summary=stage_file,
-                        output_summary=f"已写入 {len(reply)} 字符",
-                        status="success",
-                        created_by=session_for_update.created_by,
+                if artifact_content is not None:
+                    session_for_update.draft_content = artifact_content
+                    write_workspace_file(SimpleNamespace(root_path=workspace_root_path), stage_file, artifact_content)
+                    update_db.add(
+                        StageToolCall(
+                            session_id=session_id_value,
+                            tool_name="write_stage_artifact_file",
+                            input_summary=stage_file,
+                            output_summary=f"已写入 {len(artifact_content)} 字符",
+                            status="success",
+                            created_by=session_for_update.created_by,
+                        )
                     )
-                )
+                else:
+                    update_db.add(
+                        StageToolCall(
+                            session_id=session_id_value,
+                            tool_name="skip_stage_artifact_file",
+                            input_summary=stage_file,
+                            output_summary="AI 回复未包含明确产物块，已仅保存为会话消息",
+                            status="success",
+                            created_by=session_for_update.created_by,
+                        )
+                    )
                 if command_id_value:
                     command_for_update = update_db.get(StageCommand, command_id_value)
                     if command_for_update:

@@ -782,11 +782,15 @@ const handleStreamEvent = (rawEvent, assistantMessageId) => {
   }
   if (event === 'done') {
     stageSession.value = payload
-    updateStageDraftForm({
-      artifact_title: payload.draft_title || stageDraftForm.value.artifact_title,
-      artifact_type: payload.draft_type || stageDraftForm.value.artifact_type,
-      artifact_content: payload.draft_content || stageDraftForm.value.artifact_content
-    })
+    const nextDraftContent = payload.draft_content || ''
+    const hasDraftUpdate = nextDraftContent && nextDraftContent !== stageDraftForm.value.artifact_content
+    if (hasDraftUpdate) {
+      updateStageDraftForm({
+        artifact_title: payload.draft_title || stageDraftForm.value.artifact_title,
+        artifact_type: payload.draft_type || stageDraftForm.value.artifact_type,
+        artifact_content: nextDraftContent
+      })
+    }
     loadStageExecutionState()
     scrollMessagesToBottom()
     return
